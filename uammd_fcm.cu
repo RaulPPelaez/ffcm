@@ -1,4 +1,7 @@
+/* Raul P. Pelaez 2022. Adapting the UAMMD FCM module to function as the far field component in the
+   new Fast-FCM code
 
+ */
 
 #include "Integrator/BDHI/FCM/FCM_impl.cuh"
 #include<thrust/device_vector.h>
@@ -24,7 +27,7 @@ using gpu_container = thrust::device_vector<T>;
 // In this case the FCM is going to be used as a part of a bigger code, called
 // F-FCM, which involves using the above formalism with a modified spreading
 // kernel. In particular, we define:
-// \delta_a(\vec{r}) = (a + b r^2 + c)\exp(\tau r^2)
+// \delta_a(\vec{r}) = (a + b r^2)\exp(\tau r^2)
 
 // In UAMMD the kernel is expected to be separable, so that
 // \delta_a(\vec{r}) F_i = SomeOperation(F_i, \phi(r_x), \phi(r_y), \phi(rz)).
@@ -64,9 +67,9 @@ public:
 // Since spreading and interpolation are adjoint operations, the same function
 // is used for both responsabilities.
 struct WeightCompute{
-  real a,b,c;
-  WeightCompute(real a, real b, real c):
-    a(a), b(b), c(c){}
+  real a,b;
+  WeightCompute(real a, real b):
+    a(a), b(b){}
 
 
   __device__ real getKernelWeight(thrust::tuple<real2, real2, real2> kernel){
@@ -76,7 +79,7 @@ struct WeightCompute{
     real phiY = thrust::get<1>(kernel).y;
     real rz = thrust::get<2>(kernel).x;
     real phiZ = thrust::get<2>(kernel).y;
-    return (a+rx*rx+ry*ry+rz*rz*b + b)*phiX*phiY*phiZ;
+    return (a+(rx*rx+ry*ry+rz*rz)*b)*phiX*phiY*phiZ;
   }
 
   template<class T>
@@ -91,38 +94,39 @@ int main(){
   int numberParticles = 1;
   gpu_container<real4> pos(numberParticles);
   gpu_container<real4> force(numberParticles);
-  gpu_container<real4> torque(numberParticles);
   //Fill everything with zeros
   thrust::fill(force.begin(), force.end(), real4());
-  thrust::fill(torque.begin(), torque.end(), real4());
   thrust::fill(pos.begin(), pos.end(), real4());
   //A force on the first particle in the X direction
   force[0] = {1, 0, 0, 0};
 
-  //Some arbitrary parameters for the kernel
-  real a = 1;
-  real b = 1;
-  real c = 1;
-  real tau = 1;
-  int support = 5;
+  //Some arbitrary parameters for the kernel.
+  //This configures the kernel to be identical to the standard FCM with a hydrodynamic radius of 1.
+  // This is thus a small test, given that we are pulling the particle in the X direction,
+  // we should expect the result to be M0 ~ 1/(6*pi*eta)*(1-2.83/L).
+  // Using L=32 and eta=1/(6*pi) we should see M0 ~ 0.9115
+  real sigma = 1.0/sqrt(M_PI);
+  real a = pow(2*M_PI*sigma*sigma, -1.5);
+  real b = 0;
+  real tau = -0.5/(sigma*sigma);
+  int support = 9;
   // UAMMD requests most objects and functors as shared pointers.
   // Besides guarding the code against memory errors shared_ptr
   //  eases the sending of objects to the GPU.
   auto kernel = std::make_shared<Gaussian>(tau, support);
-  auto wc = std::make_shared<WeightCompute>(a,b,c);
+  auto wc = std::make_shared<WeightCompute>(a,b);
 
   //The UAMMD fcm module can be specialized for a certain kernel for the monopole and the dipoles,
   // and also for a certain WeightCompute for the IBM module.
   using FCM = uammd::BDHI::FCM_impl<Gaussian, Gaussian, WeightCompute>;
   FCM::Parameters par;
-  par.cells = {32,32,32};   //Grid dimensions
+  par.cells = {64,64,64};   //Grid dimensions
   par.box = Box({32,32,32}); //Domain size
   par.kernel = kernel;       //The ibm kernels
   par.kernelTorque = kernel; //You probably want another different instance for torques.
   par.wc = wc;               //The weight compute for ibm
-  par.viscosity = 1.0;       //An arbitrary viscosity
+  par.viscosity = 1.0/(6*M_PI);       //An arbitrary viscosity
   auto fcm = std::make_shared<FCM>(par);
-
 
     // Computes the hydrodynamic displacements, defined as
     //d\vec{q} = M FT + pref\sqrt{2kT M} dW.
@@ -133,7 +137,8 @@ int main(){
   //We take the addresses of the containers
   auto pos_ptr = pos.data().get();
   auto force_ptr = force.data().get();
-  auto torque_ptr = torque.data().get();
+  //The computation is skipped if there are no torques
+  auto torque_ptr = nullptr; //torque.data().get();
   cudaStream_t st = 0; //Let us use the default stream
   auto displacements = fcm->computeHydrodynamicDisplacements(pos_ptr, force_ptr, torque_ptr,
 							     numberParticles,
@@ -146,7 +151,6 @@ int main(){
   std::vector<real3> host_monopoles(numberParticles);
   //Thrust is smart enough to detect that this is a GPU to CPU copy
   thrust::copy(monopoles.begin(), monopoles.end(), host_monopoles.begin());
-
   //Lets print all of them
   for(auto mf: host_monopoles){
     std::cout<<mf<<std::endl;
