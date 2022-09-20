@@ -1,0 +1,3 @@
+[submodule "uammd"]
+	path = uammd
+	url = git@github.com:raulppelaez/uammd
